@@ -119,42 +119,73 @@ async def scrape_listing(context, query, status_log):
     return list(unique_items.values())
 
 
+# --- ОБНОВЛЕННАЯ ФУНКЦИЯ (ВСТАВИТЬ ВМЕСТО СТАРОЙ fetch_phone) ---
 async def fetch_phone(context, item, semaphore):
     async with semaphore:
+        # Создаем новую страницу для каждого потока
         page = await context.new_page()
         try:
+            # Случайная задержка
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await page.goto(item['link'], timeout=40000)
+            
+            # Уменьшили таймаут до 25 сек (чтобы быстрее пропускал зависшие)
+            await page.goto(item['link'], timeout=25000)
+            
             try:
-                await page.wait_for_selector(".orgpage-phones-view__phone-number", timeout=5000)
+                # Ждем телефон
+                await page.wait_for_selector(".orgpage-phones-view__phone-number", timeout=4000)
                 els = await page.query_selector_all(".orgpage-phones-view__phone-number")
-                item['phone'] = ", ".join([await e.inner_text() for e in els])
+                phones = [await e.inner_text() for e in els]
+                item['phone'] = ", ".join(phones)
             except:
-                item['phone'] = "-"
-        except:
-            item['phone'] = "Ошибка"
+                item['phone'] = "Не указан / Скрыт"
+        except Exception as e:
+            item['phone'] = "Ошибка загрузки"
         finally:
             await page.close()
+            # Важно: мы не пишем st.write здесь, чтобы не ломать потоки UI
 
-
+# --- ОБНОВЛЕННАЯ ФУНКЦИЯ ЗАПУСКА (ВСТАВИТЬ ВМЕСТО СТАРОЙ run_process) ---
 async def run_process():
-    status = st.status("Запуск...", expanded=True)
+    # Создаем контейнер статуса
+    status_container = st.status("Запуск процесса...", expanded=True)
+    
     async with async_playwright() as p:
-        # В облаке ВСЕГДА headless=True
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
-
-        items = await scrape_listing(context, search_query, status)
+        # Важно: User Agent для маскировки
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        
+        # 1. Сбор ссылок
+        items = await scrape_listing(context, search_query, status_container)
+        
         if not items:
-            status.error("Пусто.")
+            status_container.error("Ничего не найдено.")
+            await browser.close()
             return None
 
-        status.write(f"Найдено {len(items)}. Сбор телефонов...")
-        sem = asyncio.Semaphore(concurrency)
-        tasks = [fetch_phone(context, item, sem) for item in items]
-        await asyncio.gather(*tasks)
-
-        status.update(label="Готово!", state="complete", expanded=False)
+        status_container.write(f"✅ Список собран: {len(items)} объектов.")
+        
+        # 2. Сбор телефонов с ЖИВЫМ прогресс-баром
+        semaphore = asyncio.Semaphore(concurrency)
+        tasks = [fetch_phone(context, item, semaphore) for item in items]
+        
+        # Создаем прогресс-бар
+        phone_bar = st.progress(0, text="📞 Начинаем обзвон...")
+        
+        # МАГИЯ ЗДЕСЬ: as_completed позволяет обновлять бар по мере выполнения
+        for i, future in enumerate(asyncio.as_completed(tasks)):
+            await future # Ждем завершения любой следующей задачи
+            
+            # Обновляем процент
+            progress_percent = (i + 1) / len(items)
+            phone_bar.progress(progress_percent, text=f"📞 Сбор телефонов: {i + 1} из {len(items)}")
+        
+        phone_bar.empty() # Убираем бар когда готово
+        status_container.update(label="Готово!", state="complete", expanded=False)
+        await browser.close()
         return items
 
 
@@ -167,4 +198,5 @@ else:
     st.success(f"Собрано: {len(df)}")
     st.dataframe(df)
     csv = df.to_csv(index=False, sep=';', encoding='utf-8-sig').encode('utf-8-sig')
+
     st.download_button("Скачать CSV", csv, "data.csv", "text/csv")
