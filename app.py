@@ -118,32 +118,34 @@ async def scrape_listing(context, query, status_log):
     await page.close()
     return list(unique_items.values())
 
-
-# --- ОБНОВЛЕННАЯ ФУНКЦИЯ (ВСТАВИТЬ ВМЕСТО СТАРОЙ fetch_phone) ---
 async def fetch_phone(context, item, semaphore):
     async with semaphore:
-        # Создаем новую страницу для каждого потока
         page = await context.new_page()
+        debug_screenshot = None # Переменная для скриншота
         try:
-            # Случайная задержка
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            
-            # Уменьшили таймаут до 25 сек (чтобы быстрее пропускал зависшие)
-            await page.goto(item['link'], timeout=25000)
-            
+            # Чуть больше пауза и таймаут
+            await asyncio.sleep(random.uniform(1.5, 4.0))
+            await page.goto(item['link'], timeout=30000)
+
             try:
-                # Ждем телефон
-                await page.wait_for_selector(".orgpage-phones-view__phone-number", timeout=4000)
+                # 1. Пробуем найти телефон сразу
+                await page.wait_for_selector(".orgpage-phones-view__phone-number", timeout=5000)
                 els = await page.query_selector_all(".orgpage-phones-view__phone-number")
                 phones = [await e.inner_text() for e in els]
                 item['phone'] = ", ".join(phones)
+            
             except:
-                item['phone'] = "Не указан / Скрыт"
+                # 2. Если не нашли - делаем СКРИНШОТ, чтобы понять почему
+                item['phone'] = "Не найден (см. скрин)"
+                # Делаем скриншот только для первых 3 ошибок, чтобы не забить память
+                debug_screenshot = await page.screenshot(full_page=False)
+
         except Exception as e:
             item['phone'] = "Ошибка загрузки"
         finally:
             await page.close()
-            # Важно: мы не пишем st.write здесь, чтобы не ломать потоки UI
+            return debug_screenshot # Возвращаем картинку
+
 
 # --- ОБНОВЛЕННАЯ ФУНКЦИЯ ЗАПУСКА (ВСТАВИТЬ ВМЕСТО СТАРОЙ run_process) ---
 async def run_process():
@@ -168,22 +170,35 @@ async def run_process():
 
         status_container.write(f"✅ Список собран: {len(items)} объектов.")
         
-        # 2. Сбор телефонов с ЖИВЫМ прогресс-баром
         semaphore = asyncio.Semaphore(concurrency)
-        tasks = [fetch_phone(context, item, semaphore) for item in items]
+        tasks = []
         
-        # Создаем прогресс-бар
+        # Создаем список задач (Notice: мы немного меняем логику запуска для отладки)
+        # Нам нужно обернуть вызов, чтобы получить результат (скриншот)
+        async def task_wrapper(ctx, itm, sem):
+            screenshot = await fetch_phone(ctx, itm, sem)
+            return screenshot
+
+        tasks = [task_wrapper(context, item, semaphore) for item in items]
+        
         phone_bar = st.progress(0, text="📞 Начинаем обзвон...")
         
-        # МАГИЯ ЗДЕСЬ: as_completed позволяет обновлять бар по мере выполнения
-        for i, future in enumerate(asyncio.as_completed(tasks)):
-            await future # Ждем завершения любой следующей задачи
-            
-            # Обновляем процент
-            progress_percent = (i + 1) / len(items)
-            phone_bar.progress(progress_percent, text=f"📞 Сбор телефонов: {i + 1} из {len(items)}")
+        # Блок для отображения ошибок
+        error_expander = st.expander("📸 Скриншоты ошибок (Debug)", expanded=True)
         
-        phone_bar.empty() # Убираем бар когда готово
+        for i, future in enumerate(asyncio.as_completed(tasks)):
+            screenshot = await future
+            
+            # Если бот прислал скриншот (значит была ошибка)
+            if screenshot:
+                with error_expander:
+                    st.image(screenshot, caption=f"Что увидел бот на странице {i}", use_container_width=True)
+                    st.warning("Если вы видите здесь Капчу или 'SmartCaptcha' — значит Яндекс заблокировал IP сервера.")
+            
+            progress_percent = (i + 1) / len(items)
+            phone_bar.progress(progress_percent, text=f"📞 Обработано: {i + 1} из {len(items)}")
+        
+        phone_bar.empty()
         status_container.update(label="Готово!", state="complete", expanded=False)
         await browser.close()
         return items
@@ -200,3 +215,4 @@ else:
     csv = df.to_csv(index=False, sep=';', encoding='utf-8-sig').encode('utf-8-sig')
 
     st.download_button("Скачать CSV", csv, "data.csv", "text/csv")
+
