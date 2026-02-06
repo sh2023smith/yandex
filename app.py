@@ -27,10 +27,10 @@ def install_browser():
 
 install_browser()
 
-st.set_page_config(page_title="Debug Parser", page_icon="📸", layout="wide")
-st.title("📸 Парсер с Фото-Отчетом ошибок")
+st.set_page_config(page_title="Universal Parser", page_icon="📞", layout="wide")
+st.title("📞 Парсер: Универсальный сборщик")
 
-# --- ФУНКЦИИ ---
+# --- ФУНКЦИИ ПРОКСИ ---
 
 def get_proxy_config():
     if "proxy" in st.secrets:
@@ -53,25 +53,26 @@ def rotate_ip(api_url):
     except:
         return False
 
+# --- ПАРСИНГ ---
+
 async def scrape_listing(context, query, status_log, proxy_conf):
     page = await context.new_page()
-    status_log.info(f"🔍 Захожу на Яндекс...")
+    status_log.info(f"🔍 Вход в список...")
 
-    # --- 1. ВХОД НА САЙТ (С РОТАЦИЕЙ) ---
+    # Попытки входа (ротация)
     for attempt in range(1, 4):
         try:
             try:
                 await page.goto("https://yandex.ru/maps", timeout=60000)
-            except:
-                status_log.warning(f"⚠️ Таймаут загрузки страницы (Попытка {attempt}).")
+            except: pass
             
-            # Проверка на капчу
+            # Проверка капчи
             is_captcha = await page.query_selector(".SmartCaptcha-Button") or \
                          await page.query_selector("text=Подтвердите, что")
 
             if is_captcha:
                 if proxy_conf and proxy_conf.get('api_url'):
-                    status_log.warning(f"🛑 Капча. Меняю IP (Попытка {attempt}/3)... Ждите 15 сек.")
+                    status_log.warning(f"🛑 Капча на входе. Ротация IP (Попытка {attempt})...")
                     rotate_ip(proxy_conf['api_url'])
                     await asyncio.sleep(15)
                     await context.clear_cookies()
@@ -79,51 +80,33 @@ async def scrape_listing(context, query, status_log, proxy_conf):
                 else:
                     return []
 
-            # Ищем поле поиска
             try:
                 await page.wait_for_selector("input.input__control", state="visible", timeout=20000)
-                status_log.success(f"✅ Успешный вход (Попытка {attempt})!")
+                status_log.success(f"✅ Вход выполнен.")
                 break 
             except:
-                status_log.warning("Поле поиска не появилось. Меняю IP...")
+                status_log.warning("Поля поиска нет. Ротация...")
                 if proxy_conf and proxy_conf.get('api_url'):
                     rotate_ip(proxy_conf['api_url'])
                     await asyncio.sleep(15)
                     await context.clear_cookies()
                     continue
-                
         except Exception as e:
-            status_log.error(f"Сбой: {e}")
             return []
     
-    # --- 2. ПОИСК И СПИСОК ---
+    # Поиск
     try:
-        # Вводим запрос
         await page.fill("input.input__control", query)
-        await asyncio.sleep(1) # Пауза перед Enter
+        await asyncio.sleep(1)
         await page.keyboard.press("Enter")
         
-        status_log.info("⏳ Запрос отправлен. Жду список результатов (45 сек)...")
-        
         list_selector = ".search-list-view__list"
-        
-        try:
-            # Ждем список 45 секунд
-            await page.wait_for_selector(list_selector, timeout=45000)
-            await page.click(list_selector)
-        except:
-            # !!! ЕСЛИ НЕ НАШЛИ СПИСОК - ФОТОГРАФИРУЕМ !!!
-            status_log.error("❌ Список не появился вовремя.")
-            screenshot = await page.screenshot()
-            st.image(screenshot, caption="ЭКРАН ОШИБКИ: Что видит бот?", width=600)
-            status_log.warning("☝️ Посмотрите на фото выше. Если там пусто - Яндекс тормозит. Если там 'Ничего не найдено' - проверьте запрос.")
-            return []
-
-    except Exception as e:
-        status_log.error(f"Ошибка логики поиска: {e}")
+        await page.wait_for_selector(list_selector, timeout=45000)
+        await page.click(list_selector)
+    except:
+        status_log.error("❌ Не удалось загрузить список.")
         return []
 
-    # --- 3. СБОР ССЫЛОК ---
     unique_items = {}
     stuck_counter = 0
     last_len = 0
@@ -163,21 +146,59 @@ async def scrape_listing(context, query, status_log, proxy_conf):
     await page.close()
     return list(unique_items.values())
 
+# --- УЛУЧШЕННАЯ ФУНКЦИЯ ПОИСКА ТЕЛЕФОНА ---
 async def fetch_phone(context, item, semaphore):
     async with semaphore:
         page = await context.new_page()
         try:
             await asyncio.sleep(random.uniform(1.0, 3.0))
-            await page.goto(item['link'], timeout=45000)
+            # Таймаут побольше для прокси
+            await page.goto(item['link'], timeout=50000)
+
+            # 1. Проверка на капчу внутри карточки
+            if await page.query_selector(".SmartCaptcha-Button"):
+                item['phone'] = "Капча (Пропуск)"
+                return
+
+            # 2. Ищем кнопку "Показать телефон" и кликаем
             try:
-                await page.wait_for_selector(".orgpage-phones-view__phone-number", timeout=5000)
+                # Ищем кнопку по тексту или классу
+                show_btn = await page.query_selector("button:has-text('Показать телефон')") or \
+                           await page.query_selector(".card-phones-view__more-button")
+                if show_btn:
+                    await show_btn.click()
+                    await asyncio.sleep(1) # Ждем раскрытия
+            except: pass
+
+            # 3. СТРАТЕГИЯ "ПЫЛЕСОС": Собираем все ссылки tel:
+            # Это самый надежный способ, работает на мобилках и десктопе
+            phones_found = []
+            
+            # Ищем теги <a href="tel:...">
+            tel_links = await page.query_selector_all("a[href^='tel:']")
+            for link in tel_links:
+                href = await link.get_attribute("href")
+                if href:
+                    # Убираем 'tel:' и добавляем в список
+                    clean_phone = href.replace("tel:", "").strip()
+                    if clean_phone not in phones_found:
+                        phones_found.append(clean_phone)
+            
+            # 4. Если ссылок нет, пробуем искать старый добрый текст
+            if not phones_found:
                 els = await page.query_selector_all(".orgpage-phones-view__phone-number")
-                phones = [await e.inner_text() for e in els]
-                item['phone'] = ", ".join(phones)
-            except:
-                item['phone'] = "Скрыт/Нет"
-        except:
-            item['phone'] = "Ошибка"
+                for e in els:
+                    txt = await e.inner_text()
+                    if txt not in phones_found:
+                        phones_found.append(txt)
+
+            if phones_found:
+                item['phone'] = ", ".join(phones_found)
+            else:
+                item['phone'] = "Нет номера"
+
+        except Exception as e:
+            item['phone'] = "Ошибка загрузки"
         finally:
             await page.close()
 
@@ -194,6 +215,7 @@ async def run_process(query):
             browser = await p.chromium.launch(headless=True, proxy=proxy_conf)
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
+                # Маскируемся под обычный Chrome
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
                 ignore_https_errors=True
             )
@@ -206,9 +228,10 @@ async def run_process(query):
 
             if TEST_LIMIT_2: items = items[:2]
             
-            status.write(f"Найдено {len(items)}. Сбор телефонов...")
+            status.write(f"Найдено {len(items)}. Сбор телефонов (Медленный режим)...")
             
-            sem = asyncio.Semaphore(5)
+            # ВАЖНО: Снижаем до 2 потоков, чтобы прокси успевал грузить страницы
+            sem = asyncio.Semaphore(2) 
             tasks = [fetch_phone(context, item, sem) for item in items]
             
             ph_bar = st.progress(0, text="Обзвон...")
@@ -230,10 +253,8 @@ if 'results' not in st.session_state: st.session_state.results = None
 
 with st.sidebar:
     st.header("Панель управления")
-    if "proxy" in st.secrets and "api_url" in st.secrets["proxy"]:
-        st.success("✅ Авто-смена IP подключена")
-    else:
-        st.error("❌ Нет API URL в Secrets")
+    if "proxy" in st.secrets:
+        st.success("✅ Прокси OK")
         
     query = st.text_input("Запрос", value="Салон красоты Ташкент Юнусабад")
     
