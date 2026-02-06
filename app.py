@@ -48,35 +48,48 @@ def get_proxy_config():
 
 async def scrape_listing(context, query, status_log):
     page = await context.new_page()
-    status_log.info(f"🔍 [Прокси] Ищу: {query}")
+    status_log.info(f"🔍 [Прокси] Захожу на Яндекс...")
     
     try:
-        # Проверка IP (чтобы убедиться, что AstroProxy работает)
+        # Проверка IP (оставляем как было)
         try:
             await page.goto("http://lumtest.com/myip.json", timeout=15000)
             content = await page.content()
             if "ip" in content:
                 status_log.success("✅ Прокси работает! IP скрыт.")
         except:
-            status_log.warning("⚠️ Не удалось проверить IP, но пробуем продолжить...")
+            status_log.warning("⚠️ Проверка IP не прошла, но пробуем дальше...")
 
-        await page.goto("https://yandex.ru/maps", timeout=60000)
-        
+        # --- ЗАХОД НА ЯНДЕКС ---
         try:
-            await page.wait_for_selector("input.input__control", timeout=25000)
+            # Даем 60 секунд на загрузку
+            await page.goto("https://yandex.ru/maps", timeout=60000, wait_until="domcontentloaded")
+            
+            # !!! СРАЗУ ПОКАЗЫВАЕМ СКРИНШОТ !!!
+            # Это покажет, загрузилась карта или капча
+            screenshot = await page.screenshot()
+            st.image(screenshot, caption="Что видит бот прямо сейчас", width=500)
+            
+        except Exception as e:
+            status_log.error(f"Не удалось открыть yandex.ru: {e}")
+            return []
+        
+        # Ждем строку поиска
+        try:
+            status_log.write("⏳ Ищу поле поиска...")
+            await page.wait_for_selector("input.input__control", timeout=20000)
         except:
-            status_log.error("⚠️ Яндекс не пускает (Капча). Попробуйте сменить IP в панели AstroProxy.")
-            # Делаем скриншот для отладки
-            scr = await page.screenshot()
-            st.image(scr, caption="Ошибка входа", width=400)
+            status_log.error("⚠️ Не вижу строку поиска! Скорее всего на скриншоте выше — КАПЧА.")
             return []
 
         await page.fill("input.input__control", query)
         await page.keyboard.press("Enter")
         
+        status_log.write("⏳ Жду результаты...")
         list_selector = ".search-list-view__list"
         await page.wait_for_selector(list_selector, timeout=25000)
         await page.click(list_selector)
+        
     except Exception as e:
         status_log.error(f"Ошибка поиска: {e}")
         return []
@@ -85,7 +98,6 @@ async def scrape_listing(context, query, status_log):
     stuck_counter = 0
     last_len = 0
     
-    # Лимит скроллов
     max_scrolls = 40 
     bar = st.progress(0, text="Скроллинг...")
 
@@ -132,6 +144,7 @@ async def scrape_listing(context, query, status_log):
     bar.empty()
     await page.close()
     return list(unique_items.values())
+
 
 async def fetch_phone(context, item, semaphore):
     async with semaphore:
@@ -231,3 +244,4 @@ if st.session_state.results:
     st.dataframe(df)
     csv = df.to_csv(index=False, sep=';', encoding='utf-8-sig').encode('utf-8-sig')
     st.download_button("Скачать CSV", csv, "proxy_data.csv")
+
