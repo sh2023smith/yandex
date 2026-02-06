@@ -7,18 +7,17 @@ import nest_asyncio
 import sys
 import subprocess
 import traceback
+import urllib.request
+import ssl
 
 # --- НАСТРОЙКИ ---
-# Ставим False, чтобы собирать все найденные записи
-TEST_LIMIT_2 = False 
+TEST_LIMIT_2 = False # Собираем всё без ограничений
 
-# Фикс для Windows (на всякий случай)
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 nest_asyncio.apply()
 
-# Установка браузера
 @st.cache_resource
 def install_browser():
     try:
@@ -28,77 +27,107 @@ def install_browser():
 
 install_browser()
 
-st.set_page_config(page_title="Yandex Proxy Parser", page_icon="🕵️", layout="wide")
-st.title("🕵️ Парсер с Прокси (AstroProxy)")
+st.set_page_config(page_title="Auto-Rotate Parser", page_icon="🤖", layout="wide")
+st.title("🤖 Парсер с Авто-Сменой IP")
 
-# --- ПРОВЕРКА НАСТРОЕК ПРОКСИ ---
+# --- ФУНКЦИИ ---
+
 def get_proxy_config():
-    """Читает прокси из st.secrets"""
     if "proxy" in st.secrets:
-        # Формируем строку подключения
         return {
             "server": f"http://{st.secrets['proxy']['server']}",
             "username": st.secrets['proxy']['username'],
-            "password": st.secrets['proxy']['password']
+            "password": st.secrets['proxy']['password'],
+            "api_url": st.secrets['proxy'].get('api_url')
         }
-    else:
-        return None
+    return None
 
-# --- ФУНКЦИИ ПАРСИНГА ---
-
-async def scrape_listing(context, query, status_log):
-    page = await context.new_page()
-    status_log.info(f"🔍 [Прокси] Захожу на Яндекс...")
-    
+def rotate_ip(api_url):
+    """Дергает API для смены IP"""
+    if not api_url: return False
     try:
-        # Проверка IP (оставляем как было)
-        try:
-            await page.goto("http://lumtest.com/myip.json", timeout=15000)
-            content = await page.content()
-            if "ip" in content:
-                status_log.success("✅ Прокси работает! IP скрыт.")
-        except:
-            status_log.warning("⚠️ Проверка IP не прошла, но пробуем дальше...")
-
-        # --- ЗАХОД НА ЯНДЕКС ---
-        try:
-            # Даем 60 секунд на загрузку
-            await page.goto("https://yandex.ru/maps", timeout=60000, wait_until="domcontentloaded")
-            
-            # !!! СРАЗУ ПОКАЗЫВАЕМ СКРИНШОТ !!!
-            # Это покажет, загрузилась карта или капча
-            screenshot = await page.screenshot()
-            st.image(screenshot, caption="Что видит бот прямо сейчас", width=500)
-            
-        except Exception as e:
-            status_log.error(f"Не удалось открыть yandex.ru: {e}")
-            return []
+        # Игнорируем проверки SSL для API, чтобы точно сработало
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
         
-        # Ждем строку поиска
-        try:
-            status_log.write("⏳ Ищу поле поиска...")
-            await page.wait_for_selector("input.input__control", timeout=20000)
-        except:
-            status_log.error("⚠️ Не вижу строку поиска! Скорее всего на скриншоте выше — КАПЧА.")
-            return []
+        with urllib.request.urlopen(api_url, context=ctx, timeout=10) as response:
+            return response.status == 200
+    except Exception as e:
+        print(f"Ошибка ротации: {e}")
+        return False
 
+async def scrape_listing(context, query, status_log, proxy_conf):
+    page = await context.new_page()
+    status_log.info(f"🔍 Захожу на Яндекс...")
+
+    # ЦИКЛ ПОПЫТОК ВХОДА (до 3 раз меняем IP)
+    for attempt in range(1, 4):
+        try:
+            # 1. Загрузка
+            try:
+                await page.goto("https://yandex.ru/maps", timeout=45000)
+            except:
+                status_log.warning(f"⚠️ Таймаут загрузки (Попытка {attempt}).")
+            
+            # 2. Проверка на КАПЧУ
+            # Ищем характерные признаки капчи
+            is_captcha = await page.query_selector(".SmartCaptcha-Button") or \
+                         await page.query_selector("text=Подтвердите, что") or \
+                         await page.query_selector("input#captcha-input")
+
+            if is_captcha:
+                if proxy_conf and proxy_conf.get('api_url'):
+                    status_log.warning(f"🛑 Обнаружена КАПЧА. Меняю IP (Попытка {attempt}/3)... Ждите 15 сек.")
+                    
+                    # Дергаем ссылку смены IP
+                    rotate_ip(proxy_conf['api_url'])
+                    
+                    # Ждем, пока AstroProxy переключит канал
+                    await asyncio.sleep(15)
+                    
+                    # Чистим куки и пробуем снова
+                    await context.clear_cookies()
+                    continue 
+                else:
+                    status_log.error("Капча! А ссылки для смены IP нет.")
+                    return []
+
+            # 3. Если капчи нет, ищем поле поиска
+            try:
+                await page.wait_for_selector("input.input__control", state="visible", timeout=15000)
+                status_log.success("✅ Успешный вход! IP чистый.")
+                break # Выходим из цикла попыток
+            except:
+                # Если поля нет, возможно, это все-таки капча или сбой
+                status_log.warning("Поле поиска не найдено. Пробую сменить IP...")
+                if proxy_conf and proxy_conf.get('api_url'):
+                    rotate_ip(proxy_conf['api_url'])
+                    await asyncio.sleep(15)
+                    await context.clear_cookies()
+                    continue
+                
+        except Exception as e:
+            status_log.error(f"Сбой соединения: {e}")
+            return []
+    
+    # --- ОСНОВНОЙ ПАРСИНГ ---
+    try:
         await page.fill("input.input__control", query)
         await page.keyboard.press("Enter")
         
-        status_log.write("⏳ Жду результаты...")
         list_selector = ".search-list-view__list"
-        await page.wait_for_selector(list_selector, timeout=25000)
+        await page.wait_for_selector(list_selector, timeout=30000)
         await page.click(list_selector)
-        
-    except Exception as e:
-        status_log.error(f"Ошибка поиска: {e}")
+    except:
+        status_log.error("❌ Не удалось найти список даже после смены IP.")
         return []
 
     unique_items = {}
     stuck_counter = 0
     last_len = 0
+    max_scrolls = 30 # Чуть меньше скроллов для скорости
     
-    max_scrolls = 40 
     bar = st.progress(0, text="Скроллинг...")
 
     for i in range(max_scrolls):
@@ -116,12 +145,7 @@ async def scrape_listing(context, query, status_log):
                     addr_el = await card.query_selector(".search-business-snippet-view__address")
                     address = await addr_el.inner_text() if addr_el else ""
                     
-                    unique_items[link] = {
-                        "name": name.strip(),
-                        "address": address.strip(),
-                        "link": link,
-                        "phone": ""
-                    }
+                    unique_items[link] = {"name": name.strip(), "address": address.strip(), "link": link, "phone": ""}
             except: continue
 
         curr = len(unique_items)
@@ -145,66 +169,57 @@ async def scrape_listing(context, query, status_log):
     await page.close()
     return list(unique_items.values())
 
-
 async def fetch_phone(context, item, semaphore):
     async with semaphore:
         page = await context.new_page()
         try:
-            await asyncio.sleep(random.uniform(1.5, 4.0))
-            await page.goto(item['link'], timeout=45000) # Увеличили таймаут для прокси
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+            await page.goto(item['link'], timeout=40000)
 
+            # Здесь сложная ротация не нужна, просто собираем что есть
             try:
-                await page.wait_for_selector(".orgpage-phones-view__phone-number", timeout=6000)
+                await page.wait_for_selector(".orgpage-phones-view__phone-number", timeout=5000)
                 els = await page.query_selector_all(".orgpage-phones-view__phone-number")
                 phones = [await e.inner_text() for e in els]
                 item['phone'] = ", ".join(phones)
             except:
                 item['phone'] = "Скрыт/Нет"
         except:
-            item['phone'] = "Ошибка загрузки"
+            item['phone'] = "Ошибка"
         finally:
             await page.close()
 
 async def run_process(query):
-    status = st.status("Запуск браузера с ПРОКСИ...", expanded=True)
-    
-    # 1. Получаем конфиг прокси
+    status = st.status("🚀 Инициализация...", expanded=True)
     proxy_conf = get_proxy_config()
     
     if not proxy_conf:
-        status.error("❌ Прокси не настроены! Добавьте их в Secrets.")
+        status.error("Нет настроек в Secrets!")
         return None
 
     try:
         async with async_playwright() as p:
-            # 2. Передаем прокси в браузер
-            browser = await p.chromium.launch(
-                headless=True, 
-                proxy=proxy_conf 
-            )
-            
-            # ignore_https_errors важен для прокси
+            browser = await p.chromium.launch(headless=True, proxy=proxy_conf)
+            # ВАЖНО: ignore_https_errors помогает с прокси
             context = await browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                ignore_https_errors=True 
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                ignore_https_errors=True
             )
             
-            # Этап 1
-            items = await scrape_listing(context, query, status)
+            # Этап 1: Список
+            items = await scrape_listing(context, query, status, proxy_conf)
             
             if not items:
-                status.error("Ничего не найдено.")
+                status.error("Список пуст.")
                 return None
-            
-            if TEST_LIMIT_2:
-                items = items[:2]
-                status.warning("Тестовый режим: берем 2 шт.")
+
+            if TEST_LIMIT_2: items = items[:2]
             
             status.write(f"Найдено {len(items)}. Сбор телефонов...")
             
-            # Этап 2
-            sem = asyncio.Semaphore(3) # 3 потока с прокси - безопасно
+            # Этап 2: Телефоны
+            sem = asyncio.Semaphore(5) # Ставим 5 потоков, раз у нас теперь мощный прокси
             tasks = [fetch_phone(context, item, sem) for item in items]
             
             ph_bar = st.progress(0, text="Обзвон...")
@@ -217,31 +232,27 @@ async def run_process(query):
             return items
 
     except Exception as e:
-        st.error("Критическая ошибка:")
+        st.error(f"Критическая ошибка: {e}")
         st.code(traceback.format_exc())
         return None
 
-# --- ИНТЕРФЕЙС ---
-
-if 'results' not in st.session_state:
-    st.session_state.results = None
+# --- UI ---
+if 'results' not in st.session_state: st.session_state.results = None
 
 with st.sidebar:
-    st.header("Настройки")
-    
-    if "proxy" in st.secrets:
-        st.success("✅ Прокси подключены")
+    st.header("Панель управления")
+    if "proxy" in st.secrets and "api_url" in st.secrets["proxy"]:
+        st.success("✅ Авто-смена IP подключена")
     else:
-        st.error("❌ Нет настроек в Secrets")
-    
+        st.error("❌ Нет API URL в Secrets")
+        
     query = st.text_input("Запрос", value="Салон красоты Ташкент Юнусабад")
     
-    if st.button("🚀 ЗАПУСТИТЬ"):
+    if st.button("🚀 ПОЕХАЛИ", type="primary"):
         st.session_state.results = asyncio.run(run_process(query))
 
 if st.session_state.results:
     df = pd.DataFrame(st.session_state.results)
     st.dataframe(df)
     csv = df.to_csv(index=False, sep=';', encoding='utf-8-sig').encode('utf-8-sig')
-    st.download_button("Скачать CSV", csv, "proxy_data.csv")
-
+    st.download_button("Скачать CSV", csv, "results.csv")
