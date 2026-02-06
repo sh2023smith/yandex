@@ -6,11 +6,11 @@ from playwright.async_api import async_playwright
 import nest_asyncio
 import sys
 import subprocess
-import traceback # Нужно для отлова ошибок
+import traceback
 
-# --- 1. НАСТРОЙКИ ---
-# Если True, скрипт возьмет только первые 2 записи для теста
-TEST_LIMIT_2 = True 
+# --- НАСТРОЙКИ ---
+# Ставим False, чтобы собирать все найденные записи
+TEST_LIMIT_2 = False 
 
 # Фикс для Windows (на всякий случай)
 if sys.platform == 'win32':
@@ -18,10 +18,9 @@ if sys.platform == 'win32':
 
 nest_asyncio.apply()
 
-# --- 2. УСТАНОВКА БРАУЗЕРА ---
+# Установка браузера
 @st.cache_resource
 def install_browser():
-    # Эта функция выполняется один раз при старте сервера
     try:
         subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
     except Exception as e:
@@ -29,38 +28,54 @@ def install_browser():
 
 install_browser()
 
-# --- 3. ИНТЕРФЕЙС ---
-st.set_page_config(page_title="Yandex Debugger", page_icon="🐞", layout="wide")
-st.title("🐞 Парсер (Режим отладки: 2 ссылки)")
+st.set_page_config(page_title="Yandex Proxy Parser", page_icon="🕵️", layout="wide")
+st.title("🕵️ Парсер с Прокси (AstroProxy)")
 
-if 'results' not in st.session_state:
-    st.session_state.results = None
+# --- ПРОВЕРКА НАСТРОЕК ПРОКСИ ---
+def get_proxy_config():
+    """Читает прокси из st.secrets"""
+    if "proxy" in st.secrets:
+        # Формируем строку подключения
+        return {
+            "server": f"http://{st.secrets['proxy']['server']}",
+            "username": st.secrets['proxy']['username'],
+            "password": st.secrets['proxy']['password']
+        }
+    else:
+        return None
 
-with st.sidebar:
-    st.header("Настройки")
-    if st.button("🔴 СБРОСИТЬ ВСЁ", type="primary"):
-        st.session_state.results = None
-        st.rerun()
-    
-    st.divider()
-    search_query = st.text_input("Запрос", value="Салон красоты Ташкент Юнусабад")
-    st.info("Сейчас включен лимит: обработка только 2-х карточек для теста.")
-
-# --- 4. ФУНКЦИИ ПАРСИНГА ---
+# --- ФУНКЦИИ ПАРСИНГА ---
 
 async def scrape_listing(context, query, status_log):
-    """Этап 1: Сбор ссылок из левой колонки"""
     page = await context.new_page()
-    status_log.write(f"🔍 Ищу: {query}")
+    status_log.info(f"🔍 [Прокси] Ищу: {query}")
     
     try:
-        await page.goto("https://yandex.ru/maps", timeout=40000)
-        await page.wait_for_selector("input.input__control", timeout=20000)
+        # Проверка IP (чтобы убедиться, что AstroProxy работает)
+        try:
+            await page.goto("http://lumtest.com/myip.json", timeout=15000)
+            content = await page.content()
+            if "ip" in content:
+                status_log.success("✅ Прокси работает! IP скрыт.")
+        except:
+            status_log.warning("⚠️ Не удалось проверить IP, но пробуем продолжить...")
+
+        await page.goto("https://yandex.ru/maps", timeout=60000)
+        
+        try:
+            await page.wait_for_selector("input.input__control", timeout=25000)
+        except:
+            status_log.error("⚠️ Яндекс не пускает (Капча). Попробуйте сменить IP в панели AstroProxy.")
+            # Делаем скриншот для отладки
+            scr = await page.screenshot()
+            st.image(scr, caption="Ошибка входа", width=400)
+            return []
+
         await page.fill("input.input__control", query)
         await page.keyboard.press("Enter")
         
         list_selector = ".search-list-view__list"
-        await page.wait_for_selector(list_selector, timeout=20000)
+        await page.wait_for_selector(list_selector, timeout=25000)
         await page.click(list_selector)
     except Exception as e:
         status_log.error(f"Ошибка поиска: {e}")
@@ -70,8 +85,8 @@ async def scrape_listing(context, query, status_log):
     stuck_counter = 0
     last_len = 0
     
-    # Скроллим немного, нам много не надо для теста
-    max_scrolls = 15 
+    # Лимит скроллов
+    max_scrolls = 40 
     bar = st.progress(0, text="Скроллинг...")
 
     for i in range(max_scrolls):
@@ -102,13 +117,14 @@ async def scrape_listing(context, query, status_log):
         
         if curr == last_len and curr > 0:
             stuck_counter += 1
-            if stuck_counter >= 3: break
+            if stuck_counter >= 5: break
         else: stuck_counter = 0
         last_len = curr
 
         try:
             await page.hover(list_selector)
             await page.keyboard.press("PageDown")
+            if i % 5 == 0: await page.keyboard.press("End")
             if cards: await cards[-1].scroll_into_view_if_needed()
         except: pass
         await asyncio.sleep(1.0)
@@ -117,80 +133,70 @@ async def scrape_listing(context, query, status_log):
     await page.close()
     return list(unique_items.values())
 
-async def fetch_phone_debug(context, item, semaphore):
-    """Этап 2: Заход в карточку + СКРИНШОТ при ошибке"""
+async def fetch_phone(context, item, semaphore):
     async with semaphore:
         page = await context.new_page()
-        screenshot = None
         try:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            # Таймаут 25 сек
-            await page.goto(item['link'], timeout=25000)
-            
+            await asyncio.sleep(random.uniform(1.5, 4.0))
+            await page.goto(item['link'], timeout=45000) # Увеличили таймаут для прокси
+
             try:
-                # Ждем телефон
-                await page.wait_for_selector(".orgpage-phones-view__phone-number", timeout=5000)
+                await page.wait_for_selector(".orgpage-phones-view__phone-number", timeout=6000)
                 els = await page.query_selector_all(".orgpage-phones-view__phone-number")
                 phones = [await e.inner_text() for e in els]
                 item['phone'] = ", ".join(phones)
             except:
-                item['phone'] = "Нет/Скрыт (см. скрин)"
-                # ДЕЛАЕМ СКРИНШОТ, ЕСЛИ ТЕЛЕФОНА НЕТ
-                screenshot = await page.screenshot(full_page=False)
-
-        except Exception as e:
-            item['phone'] = f"Ошибка: {str(e)}"
+                item['phone'] = "Скрыт/Нет"
+        except:
+            item['phone'] = "Ошибка загрузки"
         finally:
             await page.close()
-            return screenshot
 
-async def main_logic():
-    status = st.status("Запуск браузера...", expanded=True)
-    browser = None
+async def run_process(query):
+    status = st.status("Запуск браузера с ПРОКСИ...", expanded=True)
     
+    # 1. Получаем конфиг прокси
+    proxy_conf = get_proxy_config()
+    
+    if not proxy_conf:
+        status.error("❌ Прокси не настроены! Добавьте их в Secrets.")
+        return None
+
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+            # 2. Передаем прокси в браузер
+            browser = await p.chromium.launch(
+                headless=True, 
+                proxy=proxy_conf 
             )
             
-            # 1. Список
-            items = await scrape_listing(context, search_query, status)
+            # ignore_https_errors важен для прокси
+            context = await browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ignore_https_errors=True 
+            )
+            
+            # Этап 1
+            items = await scrape_listing(context, query, status)
             
             if not items:
-                status.error("Список пуст. Возможно капча сразу на входе.")
+                status.error("Ничего не найдено.")
                 return None
-
-            # --- ОГРАНИЧЕНИЕ В 2 ССЫЛКИ ---
+            
             if TEST_LIMIT_2:
-                status.warning(f"Найдено {len(items)}, но берем только 2 для теста!")
                 items = items[:2]
-            else:
-                status.write(f"Найдено {len(items)}. Обрабатываем все...")
+                status.warning("Тестовый режим: берем 2 шт.")
             
-            # 2. Телефоны
-            sem = asyncio.Semaphore(1) # Строго 1 поток для стабильности
+            status.write(f"Найдено {len(items)}. Сбор телефонов...")
             
-            # Обертка для задач
-            async def task_wrapper(ctx, itm, sm):
-                return await fetch_phone_debug(ctx, itm, sm)
-
-            tasks = [task_wrapper(context, item, sem) for item in items]
+            # Этап 2
+            sem = asyncio.Semaphore(3) # 3 потока с прокси - безопасно
+            tasks = [fetch_phone(context, item, sem) for item in items]
             
-            ph_bar = st.progress(0, text="Заход в карточки...")
-            
-            debug_expander = st.expander("📸 Скриншоты (Что видит бот)", expanded=True)
-            
+            ph_bar = st.progress(0, text="Обзвон...")
             for i, future in enumerate(asyncio.as_completed(tasks)):
-                screenshot = await future
-                
-                # Если вернулся скриншот - показываем
-                if screenshot:
-                    with debug_expander:
-                        st.image(screenshot, caption=f"Скриншот {i+1}", use_container_width=True)
-                
+                await future
                 ph_bar.progress((i+1)/len(items))
             
             ph_bar.empty()
@@ -198,30 +204,30 @@ async def main_logic():
             return items
 
     except Exception as e:
-        # ВОТ ЭТО ПОКАЖЕТ ОШИБКУ НА ЭКРАНЕ ВМЕСТО ВЫЛЕТА
-        st.error("💥 Произошла критическая ошибка!")
+        st.error("Критическая ошибка:")
         st.code(traceback.format_exc())
         return None
 
-# --- ЗАПУСК ПО КНОПКЕ ---
-if st.session_state.results is None:
-    if st.button("🚀 НАЧАТЬ ТЕСТ (2 ссылки)", type="primary"):
-        # Запускаем через asyncio.run, оборачивая в try-except на верхнем уровне
-        try:
-            st.session_state.results = asyncio.run(main_logic())
-            st.rerun()
-        except Exception as e:
-            st.error("Ошибка запуска Asyncio:")
-            st.code(traceback.format_exc())
+# --- ИНТЕРФЕЙС ---
 
-else:
-    st.success("Обработка завершена")
+if 'results' not in st.session_state:
+    st.session_state.results = None
+
+with st.sidebar:
+    st.header("Настройки")
+    
+    if "proxy" in st.secrets:
+        st.success("✅ Прокси подключены")
+    else:
+        st.error("❌ Нет настроек в Secrets")
+    
+    query = st.text_input("Запрос", value="Салон красоты Ташкент Юнусабад")
+    
+    if st.button("🚀 ЗАПУСТИТЬ"):
+        st.session_state.results = asyncio.run(run_process(query))
+
+if st.session_state.results:
     df = pd.DataFrame(st.session_state.results)
     st.dataframe(df)
-    
     csv = df.to_csv(index=False, sep=';', encoding='utf-8-sig').encode('utf-8-sig')
-    st.download_button("Скачать CSV", csv, "debug_data.csv", "text/csv")
-    
-    if st.button("🔄 Новый поиск"):
-        st.session_state.results = None
-        st.rerun()
+    st.download_button("Скачать CSV", csv, "proxy_data.csv")
